@@ -1,0 +1,85 @@
+# Build the four SCW ACCESS images, convert each to SIF on the runner and publish the exact SIF bytes to GHCR via ORAS, so the file
+# pulled on the cluster is byte-identical to the one hashed here.  Manual trigger only.  No secret of the user's is used: the push
+# authenticates with the workflow's own GITHUB_TOKEN.  The image recipes contain public package pins only.
+name: build-images
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  packages: write
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [scw, mlip_cuda, crystalformer, mattergen]
+    env:
+      IMG: ${{ matrix.image }}
+      WORK: /mnt/work
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space and set up scratch on /mnt
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          docker image prune --all --force
+          sudo mkdir -p "$WORK/tmp" "$WORK/cache" && sudo chown -R "$USER" "$WORK"
+          df -h / /mnt
+      - name: Install Apptainer
+        run: |
+          sudo add-apt-repository -y ppa:apptainer/ppa
+          sudo apt-get update
+          sudo apt-get install -y apptainer
+          apptainer --version
+      - name: Build the Docker image
+        run: docker build --pull -t "local/$IMG:build" "images/$IMG"
+      - name: Convert to SIF and hash it
+        env:
+          APPTAINER_TMPDIR: /mnt/work/tmp
+          APPTAINER_CACHEDIR: /mnt/work/cache
+        run: |
+          apptainer build "$WORK/$IMG.sif" "docker-daemon://local/$IMG:build"
+          docker image rm "local/$IMG:build" || true
+          sha256sum "$WORK/$IMG.sif" | cut -d' ' -f1 > "$WORK/$IMG.sif.sha256"
+          ls -l "$WORK/$IMG.sif"
+      - name: Smoke-test the SIF (CPU runner; GPU code paths are not exercised)
+        run: |
+          apptainer exec --cleanenv "$WORK/$IMG.sif" sh -c 'python3 --version && wc -l /opt/image/freeze.txt && sha256sum --version | head -1'
+      - name: Push the SIF to GHCR (ORAS)
+        run: |
+          OWNER=$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          TAG="${GITHUB_SHA::12}"
+          echo "$GITHUB_TOKEN" | apptainer registry login --username "$GITHUB_ACTOR" --password-stdin oras://ghcr.io
+          apptainer push "$WORK/$IMG.sif" "oras://ghcr.io/$OWNER/scw-access-$IMG:$TAG"
+          echo "oras://ghcr.io/$OWNER/scw-access-$IMG:$TAG" > "$WORK/$IMG.ref"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Provenance
+        run: |
+          BASE=$(sed -n 's/^FROM //p' "images/$IMG/Dockerfile" | head -1)
+          python3 - "$IMG" "$BASE" <<'PY'
+          import hashlib, json, os, subprocess, sys
+          img, base = sys.argv[1], sys.argv[2]
+          work = os.environ["WORK"]
+          sh = lambda *c: subprocess.run(c, capture_output=True, text=True).stdout.strip()
+          h = lambda p: hashlib.sha256(open(p, "rb").read()).hexdigest()
+          sif = f"{work}/{img}.sif"
+          rec = {
+              "image": img, "build_repo_commit": os.environ["GITHUB_SHA"], "run_id": os.environ["GITHUB_RUN_ID"],
+              "oras_ref": open(f"{work}/{img}.ref").read().strip(),
+              "sif_sha256": open(f"{sif}.sha256").read().strip(), "sif_bytes": os.path.getsize(sif),
+              "base_image": base, "base_repo_digests": sh("docker", "image", "inspect", "--format", "{{json .RepoDigests}}", base),
+              "dockerfile_sha256": h(f"images/{img}/Dockerfile"), "lock_sha256": h(f"images/{img}/requirements.lock"),
+              "apptainer": sh("apptainer", "--version"),
+              "freeze_sha256": hashlib.sha256(sh("apptainer", "exec", "--cleanenv", sif, "cat", "/opt/image/freeze.txt").encode()).hexdigest(),
+          }
+          json.dump(rec, open(f"{work}/{img}.provenance.json", "w"), indent=1)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
+              s.write(f"### {img}\n```json\n{json.dumps(rec, indent=1)}\n```\n")
+          print(json.dumps(rec, indent=1))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: provenance-${{ matrix.image }}
+          path: /mnt/work/${{ matrix.image }}.provenance.json

@@ -1,0 +1,13 @@
+# CrystalFormer image: the exact pins of SCW_24H_CLAUDE_2026-10-22/scripts/modal_scw_cf.py (P2), Python 3.10.
+# The CrystalFormer source is cloned at commit 31bb734a3fd006af49a021921839061e6184cbf1 into /opt/CrystalFormer (Dockerfile).
+# The checkpoint is NOT in the image: it is read from the site path pinned in jobs/sites/delta_gpu.json.
+jax[cuda12]==0.6.2
+dm-haiku==0.0.14
+optax==0.2.4
+chex==0.1.90
+numpy==2.2.6
+pandas==2.3.3
+scipy==1.15.3
+pyxtal==1.0.7
+pymatgen==2025.10.7
+huggingface_hub==0.36.0

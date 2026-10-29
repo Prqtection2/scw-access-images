@@ -1,0 +1,6 @@
+# MatterSim 1.2.5 + CHGNet 0.4.2 in one environment (A-REG and the MLIP lanes), CUDA build for the Delta GPU benchmarks.
+# Same three pins as SCW_24H_CLAUDE_2026-10-22/scripts/modal_scw_relax.py; torch pinned to venv-mattersim.txt's 2.14.1 as the +cu126 wheel (no +cu128/+cu129 wheel exists for 2.14.1).
+mattersim==1.2.5
+chgnet==0.4.2
+pymatgen==2026.9.24
+torch==2.14.1+cu126
