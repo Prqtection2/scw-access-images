@@ -1,6 +1,9 @@
 # Build the four SCW ACCESS images, convert each to SIF on the runner and publish the exact SIF bytes to GHCR via ORAS, so the file
 # pulled on the cluster is byte-identical to the one hashed here.  Manual trigger only.  No secret of the user's is used: the push
 # authenticates with the workflow's own GITHUB_TOKEN.  The image recipes contain public package pins only.
+# T0C_R1 (Codex D03): every step runs under `set -euo pipefail` and writes its observations to files; .github/scripts/provenance.py
+# hashes those exact bytes and fails closed BEFORE publication (digest-pinned base present in the pulled image, SIF hash recomputed,
+# freeze/dpkg bytes nonempty); after the push the SIF is pulled back and must hash identically before the record says published.
 name: build-images
 on:
   workflow_dispatch:
@@ -18,6 +21,9 @@ jobs:
     env:
       IMG: ${{ matrix.image }}
       WORK: /mnt/work
+    defaults:
+      run:
+        shell: bash --noprofile --norc -euo pipefail {0}
     steps:
       - uses: actions/checkout@v4
       - name: Free disk space and set up scratch on /mnt
@@ -31,9 +37,19 @@ jobs:
           sudo add-apt-repository -y ppa:apptainer/ppa
           sudo apt-get update
           sudo apt-get install -y apptainer
-          apptainer --version
+          apptainer --version > "$WORK/$IMG.apptainer_version.txt"
+          cat "$WORK/$IMG.apptainer_version.txt"
+      - name: Pull the digest-pinned base image and record it (before any build touches the image store)
+        run: |
+          BASE=$(sed -n 's/^FROM //p' "images/$IMG/Dockerfile" | head -1)
+          case "$BASE" in *@sha256:*) ;; *) echo "FROM is not pinned by digest: $BASE" >&2; exit 1;; esac
+          printf '%s\n' "$BASE" > "$WORK/$IMG.base_ref.txt"
+          docker pull "$BASE"
+          docker image inspect --format '{{json .RepoDigests}}' "$BASE" > "$WORK/$IMG.base_repo_digests.json"
+          docker image inspect --format '{{.Id}}' "$BASE" > "$WORK/$IMG.base_id.txt"
+          cat "$WORK/$IMG.base_repo_digests.json" "$WORK/$IMG.base_id.txt"
       - name: Build the Docker image
-        run: docker build --pull -t "local/$IMG:build" "images/$IMG"
+        run: docker build -t "local/$IMG:build" "images/$IMG"
       - name: Convert to SIF and hash it
         env:
           APPTAINER_TMPDIR: /mnt/work/tmp
@@ -43,43 +59,33 @@ jobs:
           docker image rm "local/$IMG:build" || true
           sha256sum "$WORK/$IMG.sif" | cut -d' ' -f1 > "$WORK/$IMG.sif.sha256"
           ls -l "$WORK/$IMG.sif"
-      - name: Smoke-test the SIF (CPU runner; GPU code paths are not exercised)
+      - name: Smoke-test the SIF and copy its records out (CPU runner; GPU code paths are not exercised)
         run: |
-          apptainer exec --cleanenv "$WORK/$IMG.sif" sh -c 'python3 --version && wc -l /opt/image/freeze.txt && sha256sum --version | head -1'
+          apptainer exec --cleanenv "$WORK/$IMG.sif" sh -c 'python3 --version && wc -l /opt/image/freeze.txt /opt/image/dpkg.txt'
+          apptainer exec --cleanenv "$WORK/$IMG.sif" cat /opt/image/freeze.txt > "$WORK/$IMG.freeze.txt"
+          apptainer exec --cleanenv "$WORK/$IMG.sif" cat /opt/image/dpkg.txt > "$WORK/$IMG.dpkg.txt"
+      - name: Provenance (fail closed, before publication)
+        run: python3 .github/scripts/provenance.py make --img "$IMG" --work "$WORK" --recipes images
       - name: Push the SIF to GHCR (ORAS)
         run: |
           OWNER=$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
-          TAG="${GITHUB_SHA::12}"
+          REF="oras://ghcr.io/$OWNER/scw-access-$IMG:${GITHUB_SHA::12}"
           echo "$GITHUB_TOKEN" | apptainer registry login --username "$GITHUB_ACTOR" --password-stdin oras://ghcr.io
-          apptainer push "$WORK/$IMG.sif" "oras://ghcr.io/$OWNER/scw-access-$IMG:$TAG"
-          echo "oras://ghcr.io/$OWNER/scw-access-$IMG:$TAG" > "$WORK/$IMG.ref"
+          apptainer push "$WORK/$IMG.sif" "$REF"
+          printf '%s\n' "$REF" > "$WORK/$IMG.ref"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Provenance
+      - name: Pull the published SIF back and finalize the provenance (the bytes must match)
+        env:
+          APPTAINER_TMPDIR: /mnt/work/tmp
+          APPTAINER_CACHEDIR: /mnt/work/cache
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          BASE=$(sed -n 's/^FROM //p' "images/$IMG/Dockerfile" | head -1)
-          python3 - "$IMG" "$BASE" <<'PY'
-          import hashlib, json, os, subprocess, sys
-          img, base = sys.argv[1], sys.argv[2]
-          work = os.environ["WORK"]
-          sh = lambda *c: subprocess.run(c, capture_output=True, text=True).stdout.strip()
-          h = lambda p: hashlib.sha256(open(p, "rb").read()).hexdigest()
-          sif = f"{work}/{img}.sif"
-          rec = {
-              "image": img, "build_repo_commit": os.environ["GITHUB_SHA"], "run_id": os.environ["GITHUB_RUN_ID"],
-              "oras_ref": open(f"{work}/{img}.ref").read().strip(),
-              "sif_sha256": open(f"{sif}.sha256").read().strip(), "sif_bytes": os.path.getsize(sif),
-              "base_image": base, "base_repo_digests": sh("docker", "image", "inspect", "--format", "{{json .RepoDigests}}", base),
-              "dockerfile_sha256": h(f"images/{img}/Dockerfile"), "lock_sha256": h(f"images/{img}/requirements.lock"),
-              "apptainer": sh("apptainer", "--version"),
-              "freeze_sha256": hashlib.sha256(sh("apptainer", "exec", "--cleanenv", sif, "cat", "/opt/image/freeze.txt").encode()).hexdigest(),
-          }
-          json.dump(rec, open(f"{work}/{img}.provenance.json", "w"), indent=1)
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
-              s.write(f"### {img}\n```json\n{json.dumps(rec, indent=1)}\n```\n")
-          print(json.dumps(rec, indent=1))
-          PY
+          rm -f "$WORK/$IMG.roundtrip.sif"
+          apptainer pull "$WORK/$IMG.roundtrip.sif" "$(cat "$WORK/$IMG.ref")"
+          python3 .github/scripts/provenance.py finalize --img "$IMG" --work "$WORK"
       - uses: actions/upload-artifact@v4
         with:
           name: provenance-${{ matrix.image }}
           path: /mnt/work/${{ matrix.image }}.provenance.json
+          if-no-files-found: error
