@@ -9,6 +9,9 @@
 #   PyRect==0.2.0
 #   PyScreeze==1.0.1
 #   pytweening==1.2.0
+#   chgnet==0.4.2        (T0C build fix, 2026-10-31: no CPython 3.13 Linux wheel, so the image build needed a compiler and
+#   nvidia-ml-py3==7.352.0  failed; nothing the scw image runs imports chgnet at module level, and CHGNet runs in the mlip
+#                           image. nvidia-ml-py3 is only a chgnet dependency.)
 # torch keeps its +cpu local version and resolves from the PyTorch CPU index; nothing else is changed.
 absl-py==2.3.1
 aiohappyeyeballs==2.6.2
@@ -39,7 +42,6 @@ certifi==2026.7.22
 cffi==2.1.0
 chardet==7.4.3
 charset-normalizer==3.5.2
-chgnet==0.4.2
 click==8.4.1
 cloudpickle==3.1.2
 colorama==0.4.6
@@ -138,7 +140,6 @@ nest-asyncio==1.6.0
 networkx==3.7
 numba==0.68.0
 numpy==2.2.6
-nvidia-ml-py3==7.352.0
 onnxruntime==1.27.0
 openai==2.43.0
 opencv-contrib-python==4.10.0.84
